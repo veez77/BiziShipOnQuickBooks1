@@ -1,0 +1,186 @@
+service: biziship-erp-hub
+frameworkVersion: '3'
+
+# Deploy:  npm run deploy              (stage "staging", QuickBooks sandbox)
+#          npm run deploy:prod          (stage "prod")
+# Required environment variables (the deploy fails loudly if one is missing):
+#   FRONTEND_RETURN_URL  where the browser lands after the QuickBooks consent (the web app's settings page)
+#   APP_BASE_URL         the web app's base URL (shipment links written into QuickBooks are built from it)
+#   ALERT_EMAIL          who gets the CloudWatch alarm emails
+# The secrets (Intuit client secret, shared key, state signing key) live in Secrets Manager, see scripts/put-secrets.mjs.
+
+provider:
+  name: aws
+  runtime: nodejs22.x
+  architecture: arm64
+  region: us-east-1
+  stage: ${opt:stage, 'staging'}
+  memorySize: 512
+  timeout: 25 # QuickBooks calls take a few seconds; the HTTP API itself allows at most 30
+  httpApi:
+    payload: '2.0'
+    metrics: true
+  logRetentionInDays: 30
+  environment:
+    NODE_OPTIONS: --enable-source-maps
+    STORE: dynamodb
+    AUTH_MODE: shared-secret
+    TABLE_NAME: !Ref HubTable
+    KMS_KEY_ID: !GetAtt HubKey.Arn
+    HUB_SECRET_ID: biziship-erp-hub/${self:provider.stage}
+    QBO_ENVIRONMENT: ${env:QBO_ENVIRONMENT, 'sandbox'}
+    # The Hub's own callback address. Register exactly this URL in the Intuit app (Keys and credentials > Redirect URIs).
+    QBO_REDIRECT_URI: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/callback'
+    FRONTEND_RETURN_URL: ${env:FRONTEND_RETURN_URL}
+    APP_BASE_URL: ${env:APP_BASE_URL}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+          Resource: !GetAtt HubTable.Arn
+        - Effect: Allow
+          Action: [kms:Encrypt, kms:Decrypt]
+          Resource: !GetAtt HubKey.Arn
+        - Effect: Allow
+          Action: [secretsmanager:GetSecretValue]
+          Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:biziship-erp-hub/${self:provider.stage}-*'
+
+functions:
+  hub:
+    handler: src/lambda.handler
+    events:
+      - httpApi:
+          method: '*'
+          path: /{proxy+}
+
+plugins:
+  - serverless-esbuild
+
+custom:
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: true
+    target: node22
+    platform: node
+    concurrency: 10
+
+package:
+  patterns:
+    - '!tests/**'
+    - '!docs/**'
+    - '!.data/**'
+    - '!.env*'
+    - '!*.md'
+
+resources:
+  # Protects the public URL (nobody can flood QuickBooks or the table) AND the other Lambdas in the account:
+  # a new AWS account allows only 10 concurrent executions IN TOTAL, shared with the ERP Gateway, so the Hub
+  # must never be able to use them all. The Hub is driven by people clicking, so 5 requests/second is plenty.
+  # Raise this together with the account's Lambda concurrency quota (Service Quotas).
+  extensions:
+    HttpApiStage:
+      Properties:
+        DefaultRouteSettings:
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+
+  Resources:
+    # One table for connections, handles, setup, one-time states and (later) shipment links. Never deleted by a stack removal.
+    HubTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        TableName: biziship-erp-hub-${self:provider.stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: pk, AttributeType: S }
+          - { AttributeName: sk, AttributeType: S }
+        KeySchema:
+          - { AttributeName: pk, KeyType: HASH }
+          - { AttributeName: sk, KeyType: RANGE }
+        TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+        PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+    # Encrypts the ERP tokens. Rotated yearly by AWS; never deleted by a stack removal.
+    HubKey:
+      Type: AWS::KMS::Key
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        Description: BiziShip ERP Hub - encrypts ERP connection tokens (${self:provider.stage})
+        EnableKeyRotation: true
+        KeyPolicy:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: AccountAdministrationThroughIam
+              Effect: Allow
+              Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }
+              Action: kms:*
+              Resource: '*'
+    HubKeyAlias:
+      Type: AWS::KMS::Alias
+      Properties:
+        AliasName: alias/biziship-erp-hub-${self:provider.stage}
+        TargetKeyId: !Ref HubKey
+
+    HubAlerts:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: biziship-erp-hub-${self:provider.stage}-alerts
+        Subscription:
+          - { Protocol: email, Endpoint: '${env:ALERT_EMAIL}' }
+
+    # Fastify turns most failures into HTTP 500 answers, so the API's 5xx count is the main signal.
+    HubServerErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: biziship-erp-hub-${self:provider.stage}-5xx
+        Namespace: AWS/ApiGateway
+        MetricName: 5xx
+        Dimensions: [{ Name: ApiId, Value: !Ref HttpApi }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 3
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: [!Ref HubAlerts]
+    HubLambdaErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: biziship-erp-hub-${self:provider.stage}-lambda-errors
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions: [{ Name: FunctionName, Value: !Ref HubLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: [!Ref HubAlerts]
+    HubThrottlesAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: biziship-erp-hub-${self:provider.stage}-throttles
+        Namespace: AWS/Lambda
+        MetricName: Throttles
+        Dimensions: [{ Name: FunctionName, Value: !Ref HubLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: [!Ref HubAlerts]
+
+  Outputs:
+    HubUrl:
+      Description: Base URL of the Hub (set as PRIVATE_ERP_HUB_URL in the web app)
+      Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+    IntuitRedirectUri:
+      Description: Register this exactly in the Intuit app's Redirect URIs
+      Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/callback'
